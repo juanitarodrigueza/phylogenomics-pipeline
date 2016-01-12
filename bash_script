@@ -1,0 +1,414 @@
+#!/bin/bash
+
+
+#These instructions are to run the pipeline in atrax, assuming the .fastq files are located in /home/atrax
+#Pipeline assumes the files are named by sampleid_<string_added_by_sequencer_place> Make a directory for each group of fastq files and move them to their respective directory
+
+for file in *fastq
+do
+nameroot=`echo "$file" | sed 's/_.*//g'`_Trinity
+mkdir $nameroot
+echo "moving fastq file to own folder"
+mv $file $nameroot
+done
+
+# start screen in detached mode (-d -m), and give it a session name ('Trinity') to avoid
+# confusion when communicating with this session later as we add commands
+screen -d -m -S Trinity
+
+
+#Assemble transcriptomes using Trinity and Trimmomatic in the background
+# create a new screen window, and run Trinity in that window without a parent shell.  so once the process ends the screen window also ends
+# this part not working yet. Figure out how to create a session and run each assembly in a separate window of the same session
+
+for directory in *Trinity
+do
+cd $directory
+Left1=`ls | grep "L001_R1_001"`
+Left2=`ls | grep "L002_R1_001"`
+Right1=`ls | grep "L001_R2_001"`
+Right2=`ls | grep "L002_R2_001"`
+screen -S Trinity -X screen tail -f /automnt/opt/bin/Trinity --seqType fq --JM 100G --trimmomatic --quality_trimming_params HEADCROP:10 --left $Left1 $Left2 --right $Right1 $Right2 --CPU 30 --output $directory_out
+cd ~/MITS652copy
+done
+
+#run assembled transcriptomes through TransDecoder
+
+/automnt/opt/trinity/20140717/trinity-plugins/TransDecoder_r20140704/TransDecoder -t trinity.fasta
+
+#reformat names and delete * and empty lines to run Hamstr
+
+ sed -i 's/|.*$//g' trinity.pep
+ sed -i 's/*//g' trinity.pep
+ sed -i 's/^$//g' TETW.pep
+ 
+#make a folder for each pep file and move it into it from within the folder run the hamstr script
+
+sh ../millipede_script.sh
+
+#after running through HamSTR and moved to same folder run the concatenate_script
+
+mkdir Millipede_HaMStR_concatenated_orthos01062016
+
+for folder in *out; do cd $folder; sh ../Millipede_Concatenate_HaMStR.sh ; cd /home/atrax/Millipede_HAMSTR/; done
+
+#then remove all empty files
+
+find . -size 0 -delete
+
+# Format sequences for the pipeline 
+#add > to the beginning of each sequence
+
+sed -i 's/^/>/g' *.fa
+
+#Delete all second instances of MSIX in each sequence (need to automate this for different reference taxon)
+
+sed -i 's/|MSIX|MSIX|/|MSIX|msix|/' *fa
+sed -i 's/|MSIX//g' *fa
+sed -i 's/msix/MSIX/g' *fa
+
+#Add new line after sequence and delete all |0| and |1|
+
+sed -i 's/|[0-9]|/\n/g' *fa
+
+#after pipeline has ran and made trees with FastTree. Do
+
+cd fast_tree_out
+ls > list.txt 
+sed -i 's/list.txt//g' list.txt 
+mkdir roots
+mv list.txt roots/
+sh ~/root_maybe
+cd roots/
+sed 's/^.\+tre$//g' list.root | egrep -v "^$" > list2.root
+cd ..
+while read line; do ROOT=`egrep -m 1 $line ./roots/list2.root`; echo "nw_reroot $ROOT > $line.out"; done<./roots/list.txt > ./roots/outroot.txt
+sh roots/outroot.txt
+cd ..
+ls
+rm *tre
+cp fast_tree_out/*tre.out .
+for tree in *tre.out; do newfile=`echo "$tree" | sed 's/\.out//g'`; mv $tree $newfile; done 
+
+#then run starting from Phylotree Pruner
+
+
+
+#Run a complete tree search in examl
+
+#get a parsimony tree from raxml
+
+#in CASIC
+
+bsub short -n 1 -o out /tools/raxml-8.1.9/raxmlHPC -y -s FcC_smatrixNoNysoJuliJTWO.phy -m PROTCATWAG -n parsimony -p 12345 -q raxml_part.txt
+
+#in ATRAX
+
+/automnt/opt/bin/raxmlHPC -y -s FcC_smatrix.phy -T 5 -m PROTCATWAG -n parsimony -p 12345 -q raxml_part.txt
+
+## make binary with examl
+
+#CASIC
+
+/tools/examl-3.0.1/parser/parse-examl -s FcC_smatrixNoNysoJuliJTWO.phy -n FcC_smatrixNoNysoJuliJTWO -m PROT -q raxml_part.txt
+
+#Atrax
+
+/automnt/opt/bin/parse-examl -s FcC_smatrixNoNysoJuliJTWO.phy -n FcC_smatrixNoNysoJuliJTWO -m PROT -q raxml_part.txt
+
+#find best tree with examl
+
+
+bsub -q short -n 75 /tools/openmpi-1.8.3/bin/mpirun  /tools/examl-3.0.1/examl/examl-AVX -s FcC_smatrixNoNysoJuliJTWO.binary -t RAxML_parsimonyTree.parsimony -m PSR -n FcC_smatrixNoNysoJuliJTWOEXAMLBESTTREE
+
+
+#in atrax
+
+/automnt/opt/bin/examl-AVX -s FcC_smatrix.binary -t RAxML_parsimonyTree.parsimony -m PSR -n FcC_smatrix
+
+#get bootstrap replicates from raxml
+
+/tools/raxml-8.1.9/raxmlHPC -# 1000 -b 12345 -f j -s FcC_smatrixNoNysoJuliJTWO.phy -m PROTCATWAG -n boot
+
+#create a script to find a parsimony tree for each replicateinCASIC
+
+for file in FcC*
+do bsub -q short -n 1 /tools/raxml-8.1.9/raxmlHPC -y -s $file -m PROTCATWAG -n T`echo "$file" | sed 's/.*BS//g'` -p 12345 -q raxml_part.txt
+
+done
+
+#create a script to find a parsimony tree for each replicateinATRAX
+
+for file in FcC*
+do 
+/automt/opt/bin/raxmlHPC -y -s $file -m PROTCATWAG -n T`echo "$file" | sed 's/.*BS//g'` -p 12345 -q raxml_part.txt
+done
+
+#make a binary file for each boot replicate using trees generatedinCASIC
+
+
+for file in FcC*
+do bsub -q short -n 1 /tools/examl-3.0.1/parser/parse-examl -s $file -m PROT -n `echo "$file" | sed 's/.*BS//g'` -q raxml_part.txt
+done
+
+#make a binary file for each boot replicate using trees generatedinATRAX
+
+for file in FcC*
+do /automnt/opt/bin/parse-examl -s $file -m PROT -n `echo "$file" | sed 's/.*BS//g'` -q raxml_part.txt
+done
+ 
+
+#run examl tree searches for replicatesCASIC
+
+for file in *binary
+do
+bsub -q medium -n 50 /tools/openmpi-1.8.3/bin/mpirun /tools/examl-3.0.1/examl/examl-AVX -s $file -m PSR -t RAxML_parsimonyTree.T`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'` -n `echo "$file" | sed 's/\.binary//g'`
+done
+
+for file in *.binary
+do binary='echo $file'
+begginning=bsub\ -q\ medium\ -n\ 50\ \/tools\/openmpi-1.8.3\/bin\/mpirun\ \/tools\/examl-3.0.1\/examl\/examl-AVX\ -s 
+model=-m\ PSR\ -t
+tree=RAxML_parsimonyTree.T`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'`\ -n
+end=`echo "$file" | sed 's/\.binary//g'`
+echo $begginning $file $model $tree $end > line$file.txt
+done
+
+#run examl tree searches for replicatesAtrax
+
+for file in *binary
+do
+screen -d -m -S run`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'` /automnt/opt/bin/examl -s $file -m PSR -t RAxML_parsimonyTree.T`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'` -n `echo "$file" | sed 's/\.binary//g'`
+done
+
+for file in *.binary
+do binary='echo $file'
+begginning=screen\ -d\ -m\ -S\ run`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'`\ \/automnt\/opt\/bin\/examl\ -s
+model=-m\ PSR\ -t
+tree=RAxML_parsimonyTree.T`echo "$file" | sed 's/.*BS//g' | sed 's/\.binary//g'`\ -n
+end=`echo "$file" | sed 's/\.binary//g'`
+echo $begginning $file $model $tree $end > line$file.txt
+done
+
+cat line* > tree_search.sh
+rm line*
+
+#draw supports onto best ExaML tree
+
+cat ExaML_result.* > boostraptrees
+
+#in CASIC
+
+bsub -q short /tools/raxml-8.1.9/raxmlHPC -m PROTCATWAG -p 12345 -f b -t ExaML_result.FcC_smatrix -z boostraptrees -n <name>
+#in ATRAX
+
+automt/opt/bin/raxmlHPC -T 20 -m PROTCATWAG -p 12345 -f b -t ExaML_result.FcC_smatrix -z boostraptrees -n <name>
+
+#make a script to run Astral tree searches per gene including 500bs replicates
+
+for file in *fas
+bsub -q short -n 10 /tools/raxml-8.1.9/raxmlHPC -f a -m PROTCATWAG -p 12345 -x 12345 -# 500 -s $file -n `echo $file`
+done
+
+for file in *fas
+do filename='echo $file'
+begginning=bsub\ -q\ short\ -n\ 10\ \/tools\/raxml-8.1.9\/raxmlHPC\ -f\ a
+model=-m\ PROTCATWAG\ -p\ 12345\ -x\ 12345\ -#\ 500
+end=-s\ `echo $file`\ -n\ `echo $file`
+line=`echo $file`
+echo $begginning $model $end > `echo $file`.txt
+done
+
+#put all best trees in a single file
+
+cat RAxML_bestTree.0* > best_ml
+
+#print the path to bootstrap trees file for each partition
+
+for file in RAxML_bootstrap*; do dir=`pwd`; echo $dir$file; done > bs_paths
+
+#run ASTRAL
+
+java -jar ~/astral.4.7.6.jar -i best_ml -b bs_paths -r 100 -o BestTrees.out
+
+#make a matrix without missing taxa for any partititon
+
+#list all OTUs
+
+cat *.fas | egrep ">" | sort | uniq > OTUs
+
+# grep OTUs in .fas files from the file OTUs and print files with all taxa
+
+ 
+ grep -c -f OTUs *.fas | grep :`wc -l OTUs | sed 's/OTUs//g'` > nomissing.txt
+ 
+ 
+#to figure out how many times each taxon is present in fasta files
+ 
+ while read line; do times=`grep -c "$line" *fas | grep -c ":1"`; echo $line $times; done < OTUs > timestaxa.txt
+ 
+#and sort by number of occurrences
+ 
+ cat timestaxa.txt | sort -n -k2
+
+#list only taxa that appear more than 1000 times
+
+cat timestaxa.txt | sort -n -k2 | egrep [0-9]{4} > OTUsReduced
+
+#find partitions with reduced OTUs
+
+
+grep -c -f OTUsReduced *.fas | grep :`wc -l OTUs | sed 's/OTUs//g'` > ReducedFastas.txt
+
+#make a directory for reduced dataset
+
+mkdir ReducedBEAST
+
+#make script to copy fastas of reduced dataset to that directory
+
+cat ReducedFastas.txt | sed 's/^/cp /g' | sed 's/$/ ReducedBEAST/g'
+
+cd ReducedBEAST
+
+#remove taxa not in the OTUsReduced list
+
+for file in *fas; do beg=while\ read\ line\;; beg2=do\ grep\ -A1\ \$line\ `echo $file`\;\ done\ OTUsReduced\ `echo $file`.red\;; echo $beg $beg2; done > remove.sh
+sed -i 's/OTUsReduced/< OTUsReduced >/g' remove.sh
+sh remove.sh
+ for file in *red; do mv $file `echo $file | sed 's/.fas.red/.fas/g'`; done
+
+#run Fasconcat to this dataset
+
+echo "Concatenating remaining alignments (FcC_smatrix.nex, FcC_smatrix.phy, FcC_smatrix.fas), creating raxml partition file (raxml_part.txt), and moving these files to the Phylogenomics directory."
+perl ~/FASconCAT_v1.0.pl -i -p -p -n -s
+python ~/fasconcat2raxml_part2.py FcC_info.xls
+mkdir Phylogenomics
+mkdir PG_backup
+cp FcC* PG_backup/
+cp FcC* Phylogenomics/
+rm FcC*
+cp raxml_part.txt Phylogenomics/
+rm raxml_part.txt
+echo
+
+#to manually remove any taxa from alignment
+
+sed '/ASIO/ { N; d; }' 09038.fas
+ 
+#make a directory for protein model selection
+
+mkdir Proteinmodel
+
+#copy all fastas there
+
+cp *fas Proteinmodel
+cd Proteinmodel
+
+#within that folder make a folder for each .fas file and move it in the folder
+
+for file in *fas ; do mkdir `echo $file | sed 's/.fas//g'`; done
+
+for file in *fas; do folder=`echo $file | sed 's/.fas//g'`; mv $file $folder; done
+
+#make a script to run proteinmodelselection in each folder 
+
+ls > dirs.txt
+ls * | grep "fas" > fastas
+sed -i 's/dirs\.txt//g' dirs.txt
+sed -i 's/^/cd /g' dirs.txt
+sed -i 's/$/; perl ~\/Proteinmodelselection.pl.pl/g' dirs.txt
+paste dirs.txt fastas.txt | column -s $'\t' -t > prot.sh
+sed -i 's/$/; cd ..;/g' prot.sh
+
+#use Beauti to make a template file and replacing the alignment with the alignment section found in BEASTgen/templates/beast.example_template
+
+for file in *fas
+do
+~/BEASTGen_v1.0/bin/beastgen TemplateNorrisPriors.xml $file `echo $file| sed 's/.fas//g'`.xml
+done 
+
+
+#change outfiles to filename
+
+for file in *xml; do sed -i "s/Template/$file/g" $file; done
+
+#simplify the name
+
+for file in *xml; do sed -i s/\.xml/run1/g $file; done
+
+#fix first line
+
+sed -i 's/<run1/<?xml/g' *xml
+
+#make files for 4 runs
+
+for file in *xml; do cp $file $file.run2; done
+for file in *xml; do cp $file $file.run3; done
+for file in *xml; do cp $file $file.run4; done
+
+#change outputfile name
+
+for file in *run2; do sed -i 's/run1/run2/g' $file; done
+for file in *run3; do sed -i 's/run1/run3/g' $file; done
+for file in *run4; do sed -i 's/run1/run4/g' $file; done
+
+
+
+#run a Beast run for each file
+
+
+for file in *xml*
+do 
+screen -d -m -S run`echo $file | sed 's/.xml//g'` /automnt/opt/bin/beast -beagle_off $file
+done
+
+#check for convergence
+#calculates ESS values and produces a list of finished analyses
+
+
+#combine logfiles with the same name root
+
+for file in *run1.log; do root=`echo $file | sed 's/.run1.log//g'`; ~/BEASTv1.8.2/bin/logcombiner -burnin `wc -l $file | sed 's/ .*//g' | sed 's/[0-9]$//g'` `ls | grep "$root"` $root.combined.logs; done
+
+#use loganalyser to calculate logfile stats
+
+for file in *combined.logs; do ~/BEASTv1.8.2/bin/loganalyser $file > $file.ESS; done
+for file in *ESS; do tail -22 $file > $file.stats; done
+rm *ESS
+
+#rm everything before table
+
+for file in *stats; do sed -i -e '1,5d' $file; done
+
+#looks for ESS values higher than 200 and makes a list of the file and how many values higher than 200 it has. If it has number of parameters the analysis has converged
+
+for file in *stats; do number=`cut -f7 $file | sed '$d' | sed '$d' | sed '$d' | sed 's/\..*//g' |  grep -c -E [2-9]\{1\}[0-9]\{2\}\|[0-9]\{1\}[0-9\]\{3,\}`; echo $file $number; done >> ESSALL
+
+#makes a list of partitions converged and then counts them
+
+cat ESSALL | grep " 20" | sed 's/ 20//g' | sed 's/.log.stats//g' | sed 's/run[0-9]//g' | sort | uniq | wc -l
+
+#once all runs have converged make directory with finished tree files to combine them
+
+mkdir finished
+cp *trees finished
+
+#combine tree files from different runs of same partition
+
+for file in *run1.trees; do root=`echo $file | sed 's/run1.trees//g'`; ~/BEASTv1.8.2/bin/logcombiner -trees -burnin `grep -c "STATE" $file | sed 's/[0-9]$//g'` `ls | grep "$root"` $root.combined.trees; done
+
+#randomly sample 10,000 trees from each partition
+
+for file in *combined.trees; do tail -`grep -c STATE $file` $file | shuf -n 10000 > $file.sample; done
+
+#add head of nexus file
+
+head -67 04606run1.trees > head
+for file in *sample; do cat head $file > $file.complete; done
+
+#combine trees from different partitions in one
+
+~/BEASTv1.8.2/bin/logcombiner -trees `ls | grep "complete"` allcombined.trees
+~/BEASTv1.8.2/bin/treeannotator allcombined.trees 38parts.con.tre 
+
+
